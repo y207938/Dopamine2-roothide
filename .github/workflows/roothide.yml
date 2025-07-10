@@ -1,8 +1,8 @@
 name: "*** build tipa file ***"
 
 on:
-  schedule:
-    - cron: '0 */2 * * *' # every 2 hours
+  # schedule:
+  #   - cron: '0 */2 * * *' # every 2 hours
   workflow_dispatch:
 
 concurrency:
@@ -80,3 +80,13 @@ jobs:
           name: roothide-Dopamine-${{ env.version }}.tipa
           path: |
             ${{ github.workspace }}/Application/roothide-Dopamine-${{ env.version }}.tipa
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Delete old artifacts (3 days+)
+        uses: c-hive/gha-remove-artifacts@v1
+        with:
+          age: '3 days'
+          skip-tags: true
