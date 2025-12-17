@@ -8,6 +8,7 @@
 #include <sandbox.h>
 #include <libproc.h>
 #include <xpc/xpc.h>
+#include <sys/proc.h>
 #include <sys/mount.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
@@ -59,7 +60,7 @@ pid_t proc_get_ppid(pid_t pid)
 }
 
 // #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
-char* proc_get_path(pid_t pid, char* buffer)
+char* proc_get_path(pid_t pid, char* buffer[PATH_MAX])
 {
     static char __thread threadbuffer[PATH_MAX];
     if(!buffer) buffer = threadbuffer;
@@ -90,12 +91,36 @@ int proc_get_pidversion(pid_t pid)
 	return uniqidinfo.p_idversion;
 }
 
-/* Status values. */
-#define SIDL    1               /* Process being created by fork. */
-#define SRUN    2               /* Currently runnable. */
-#define SSLEEP  3               /* Sleeping on an address. */
-#define SSTOP   4               /* Process debugging or suspension. */
-#define SZOMB   5               /* Awaiting collection by parent. */
+char* proc_get_identifier(pid_t pid, char buffer[255])
+{
+    static char __thread threadbuffer[255];
+    if(!buffer) buffer = threadbuffer;
+    
+    struct csheader {
+        uint32_t magic;
+        uint32_t length;
+    } header = {0};
+    
+    int result = csops(pid, CS_OPS_IDENTITY, &header, sizeof(header));
+    if (result != 0 && errno != ERANGE) {
+        return NULL;
+    }
+    
+    char* csbuffer = malloc(header.length);
+    if (!csbuffer) {
+        return NULL;
+    }
+    
+    result = csops(pid, CS_OPS_IDENTITY, csbuffer, header.length);
+    if (result == 0) {
+        char* identity = csbuffer + sizeof(struct csheader);
+        strlcpy(buffer, identity, 255);
+    }
+    
+    free(csbuffer);
+
+    return buffer;
+}
 
 int proc_paused(pid_t pid, bool* paused)
 {
@@ -125,6 +150,8 @@ int unrestrict(pid_t pid, int (*callback)(pid_t), bool resume)
 			return -1;
 		}
 		if(paused) {
+			//wait for process to be fully initialized (new task ipc enabling, csflags updating, etc.)
+			usleep(100*1000);
 			break;
 		}
         usleep(10*1000);
@@ -168,12 +195,11 @@ bool dyld_patch_enabled()
 
 int roothide_patch_proc(pid_t pid)
 {
-    if(!dyld_patch_enabled()) {
-        if(!process_force_dyld_patch(proc_get_path(pid,NULL), NULL)) {
-            return proc_patch_csflags(pid);
-        }
+    char path[PATH_MAX]={0};
+    if(dyld_patch_enabled() || process_force_dyld_patch(proc_get_path(pid,path), NULL)) {
+        return proc_patch_dyld(pid);
     }
-    return proc_patch_dyld(pid);
+    return proc_patch_csflags(pid);
 }
 
 int roothide_config_set_spinlock_fix(bool enabled)
@@ -300,7 +326,7 @@ bool hasTrollstoreLiteMarker(const char* path)
 	return ret==0;
 }
 
-bool isSubPathOf(const char* parent, const char* child)
+bool isSubPathOf(const char* child, const char* parent)
 {
 	char real_child[PATH_MAX]={0};
 	char real_parent[PATH_MAX]={0};
@@ -336,10 +362,10 @@ void ensure_jbroot_symlink(const char* filepath)
 		strlcat(jbrootpath, "/", sizeof(jbrootpath));
 	}
 
-	JBLogDebug("%s : %s", realdirpath, jbrootpath);
-
-	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) 
+	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) {
+        JBLogDebug("ensure_jbroot_symlink skip path not inside jbroot: %s", realdirpath);
 		return;
+	}
 
 	struct stat jbrootst;
 	assert(stat(jbrootpath, &jbrootst) == 0);
@@ -400,12 +426,113 @@ char* generate_sandbox_extensions(audit_token_t *processToken, bool writable)
     return sandboxExtensionsOut;
 }
 
+struct sysctl_oid {
+	struct sysctl_oid_list *  oid_parent;
+	SLIST_ENTRY(sysctl_oid) oid_link;
+	int             oid_number;
+	int             oid_kind;
+	void            *oid_arg1;
+	int             oid_arg2;
+	const char      *oid_name;
+	int             (*oid_handler)();
+	const char      *oid_fmt;
+	const char      *oid_descr; /* offsetof() field / long description */
+	int             oid_version;
+	int             oid_refcnt;
+};
+
+void oid_remove(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_remove: %p %p \n", oid_parent, oid);
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) break;
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_remove: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(current == (uint64_t)oid) {
+            uint64_t next = (uint64_t)current_oid.oid_link.sle_next;
+            JBLogDebug("oid_remove: found@%p remove %p next->%p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide, next-gSystemInfo.kernelConstant.slide);
+            kwrite64(pnext, next);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+void oid_insert(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_insert: %p %p \n", oid_parent, oid);
+
+    struct sysctl_oid insert_oid = {0};
+    kreadbuf((uint64_t)oid, &insert_oid, sizeof(insert_oid));
+
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) {
+            JBLogDebug("oid_insert: insert at end %p\n", pnext-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), 0);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_insert: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(insert_oid.oid_number < current_oid.oid_number) {
+            JBLogDebug("oid_insert: insert@%p before %p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), current);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+
 void hideDeveloperMode()
 {
-    uint64_t launch_env_logging = kread64(ksymbol(launch_env_logging));
-    uint64_t developer_mode_status = kread64(ksymbol(developer_mode_status));
-    kwrite64(ksymbol(launch_env_logging), developer_mode_status);
-    kwrite64(ksymbol(developer_mode_status), launch_env_logging);
+    uint64_t developer_mode_status_oidp = ksymbol(developer_mode_status)-offsetof(struct sysctl_oid,oid_name);
+    uint64_t launch_env_logging_oidp = ksymbol(launch_env_logging)-offsetof(struct sysctl_oid,oid_name);
+
+    struct sysctl_oid developer_mode_status={0};
+    kreadbuf(developer_mode_status_oidp, &developer_mode_status, sizeof(developer_mode_status));
+
+    struct sysctl_oid launch_env_logging={0};
+    kreadbuf(launch_env_logging_oidp, &launch_env_logging, sizeof(launch_env_logging));
+
+    //detach
+    oid_remove(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_remove(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
+
+    //reorder
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)launch_env_logging.oid_number);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)developer_mode_status.oid_number);
+
+    //exchange data
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)launch_env_logging.oid_name);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)developer_mode_status.oid_name);
+
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)launch_env_logging.oid_descr);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)developer_mode_status.oid_descr);
+
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)launch_env_logging.oid_kind);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)developer_mode_status.oid_kind);
+
+    //attach
+    oid_insert(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_insert(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
 }
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
@@ -419,6 +546,10 @@ int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
     }
     for(NSURL* fileURL in directoryEnumerator)
     {
+        NSNumber* isFile = nil;
+        [fileURL getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:nil];
+        if(!isFile || !isFile.boolValue) continue;
+
         cdhash_t cdhash={0};
         if(ensure_randomized_cdhash(fileURL.path.fileSystemRepresentation, cdhash) == 0) {
             basebins_cdhashes = realloc(basebins_cdhashes, (basebins_cdhashesCount+1) * sizeof(cdhash_t));
@@ -571,7 +702,10 @@ int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_fil
             // will fail before launchdhook injected and dyld patched, eg: opainject...
             if(jbdSpawnPatchChild(pid, should_resume) != 0) {
                 JBLogError("Failed to patch spawned process (%d) %s", pid, path);
-                return 999;
+                //jailbreak internal spawn, just let it hang forever so that we could get a panic log
+                //kill(pid, SIGQUIT); //core dump
+                //kill(pid, SIGKILL);
+                return 202;
             }
         } else {
             if (should_resume) {
@@ -641,8 +775,11 @@ void check_usreboot_msg(xpc_object_t xmsg)
 	audit_token_t clientToken = {0};
 	xpc_dictionary_get_audit_token(xmsg, &clientToken);
 
-	if(audit_token_to_euid(clientToken) != 0) {
-		JBLogError("usereboot message not from root process?");
+	uint32_t csflags = 0;
+	csops(audit_token_to_pid(clientToken), CS_OPS_STATUS, &csflags, sizeof(csflags));
+
+	if((csflags & CS_PLATFORM_BINARY) == 0) {
+		JBLogError("usereboot message not from platform process?");
 		return;
 	}
 
@@ -671,20 +808,68 @@ void roothide_handler_jbserver_msg(xpc_object_t xmsg)
 {
     check_usreboot_msg(xmsg);
 
+    audit_token_t clientToken = { 0 };
+    xpc_dictionary_get_audit_token(xmsg, &clientToken);
+
 #ifdef ENABLE_LOGS
-
-	if (!xpc_dictionary_get_value(xmsg, "jb-domain")) return;
-	if (!xpc_dictionary_get_value(xmsg, "action")) return;
-
-	audit_token_t clientToken = { 0 };
-	xpc_dictionary_get_audit_token(xmsg, &clientToken);
-
-    const char* desc = NULL;
-    JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
-        audit_token_to_pid(clientToken), 
-        proc_get_path(audit_token_to_pid(clientToken),NULL), 
-        (desc=xpc_copy_description(xmsg)));
-    if(desc) free((void*)desc);
-
+	if(xpc_dictionary_get_value(xmsg, "jb-domain") && xpc_dictionary_get_value(xmsg, "action")) {
+		const char* desc = NULL;
+		JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
+			audit_token_to_pid(clientToken), 
+			proc_get_path(audit_token_to_pid(clientToken),NULL), 
+			(desc=xpc_copy_description(xmsg)));
+		if(desc) free((void*)desc);
+	}
 #endif
+    
+    if(isBlacklistedToken(&clientToken))
+    {
+        const char* desc = NULL;
+        JBLogDebug("launchd xpc message from blacklisted process(%d) %s :\n%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL), (desc=xpc_copy_description(xmsg)));
+        if(desc) free((void*)desc);
+
+        uint64_t routine = xpc_dictionary_get_uint64(xmsg, "routine");
+        uint64_t subsystem = xpc_dictionary_get_uint64(xmsg, "subsystem");
+        if(subsystem==2 && routine==708) {
+            const char* name = xpc_dictionary_get_string(xmsg, "name");
+            if(name) {
+                char* bundle = NULL;
+                if(string_has_prefix(name, "UIKitApplication:")) {
+                    bundle = name+sizeof("UIKitApplication:")-1;
+                    char* end = strchr(bundle, '[');
+                    if(end) {
+                        asprintf(&bundle, "%.*s", (int)(end - bundle), bundle);
+                    } else {
+                        bundle = strdup(bundle);
+                    }
+                } else {
+                    bundle = strdup(name);
+                }
+
+                char client_identifier[255]={0};
+                proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
+
+                if(!string_has_prefix(bundle, client_identifier) && !string_has_prefix(bundle, "com.apple."))
+                {
+                    JBLogDebug("hide job (%s) (%s) from blacklisted process(%d) %s", name, bundle, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+                    xpc_dictionary_set_string(xmsg, "name", "");
+                }
+
+                free((void*)bundle);
+            }
+        }
+        else if(subsystem==6 && routine==301) {
+
+            int pid = xpc_dictionary_get_int64(xmsg, "pid");
+
+            char path[PATH_MAX]={0};
+            if(pid>0 && pid!=audit_token_to_pid(clientToken) && proc_get_path(pid, path)) 
+            {
+                if(hasTrollstoreMarker(path) || isSubPathOf(path, JBROOT_PATH("/"))) {
+                    JBLogDebug("hide pid %d (%s) from blacklisted process(%d) %s", pid, path, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+                    xpc_dictionary_set_int64(xmsg, "pid", INT_MAX);
+                }
+            }
+        }
+    }
 }
