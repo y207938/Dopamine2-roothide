@@ -28,6 +28,7 @@ int __sysctl_hook(int *name, u_int namelen, void *oldp, size_t *oldlenp, const v
 int __sysctlbyname(const char *name, size_t namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int __sysctlbyname_hook(const char *name, size_t namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 
+/*
 int (*sysctlbyname_orig)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
@@ -36,93 +37,52 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 	}
 	return sysctlbyname_orig(name, oldp, oldlenp, newp, newlen);
 }
+*/
 
-xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
-xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+int (*orig_bind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int new_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	xpc_object_t reply = orig_xpc_dictionary_create_reply(original);
-	if(reply && xpc_get_type(reply)==XPC_TYPE_DICTIONARY)
-	{
-		audit_token_t clientToken={0};
-		xpc_dictionary_get_audit_token(original, &clientToken);
-
-		if(isBlacklistedToken(&clientToken)) {
-			xpc_dictionary_set_value(reply, "roothide-blacklisted-process-request", original);
-		}
-	}
-
-	return reply;
+    if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in addr_in = *(struct sockaddr_in*)addr;
+        in_port_t port = ntohs(addr_in.sin_port);
+        if (port == 0) {
+			int ret = -1;
+			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)
+			{
+				addr_in.sin_port = htons(port);
+				ret = orig_bind(sockfd, (struct sockaddr*)&addr_in, addrlen);
+				if(ret==0 || errno!=EADDRINUSE) {
+					break;
+				}
+			}
+			return ret;
+        }
+    } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 addr_in6 = *(struct sockaddr_in6*)addr;
+        in_port_t port = ntohs(addr_in6.sin6_port);
+        if (port == 0) {
+			int ret = -1;
+			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)
+			{
+				addr_in6.sin6_port = htons(port);
+				ret = orig_bind(sockfd, (struct sockaddr*)&addr_in6, addrlen);
+				if(ret==0 || errno!=EADDRINUSE) {
+					break;
+				}
+			}
+			return ret;
+        }
+    }
+    return orig_bind(sockfd, addr, addrlen);
 }
 
-int (*orig_xpc_pipe_routine_reply)(xpc_object_t reply);
-int new_xpc_pipe_routine_reply(xpc_object_t reply)
-{
-	if (xpc_get_type(reply) == XPC_TYPE_DICTIONARY)
-	{
-		xpc_object_t original = xpc_dictionary_get_value(reply, "roothide-blacklisted-process-request");
-		if (original)
-		{
-			xpc_dictionary_set_value(reply, "roothide-blacklisted-process-request", NULL);
-			
-			audit_token_t clientToken={0};
-			xpc_dictionary_get_audit_token(original, &clientToken);
-
-			const char* desc = NULL;
-			JBLogDebug("xpc reply to blacklisted app (%d) %s :\n%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL), (desc=xpc_copy_description(reply)));
-			if(desc) free((void*)desc);
-
-			uint64_t routine = xpc_dictionary_get_uint64(original, "routine");
-			uint64_t subsystem = xpc_dictionary_get_uint64(original, "subsystem");
-
-			/*if(subsystem==2 && routine==708) {
-				int error = xpc_dictionary_get_int64(reply, "error");
-				if(error == 1) {
-					const char* name = xpc_dictionary_get_string(original, "name");
-
-					xpc_dictionary_set_int64(reply, "error", 113);
-				}
-			}
-			else if(subsystem==6 && routine==301) {
-
-				int pid = xpc_dictionary_get_int64(original, "pid");
-				uint64_t outgsk = xpc_dictionary_get_uint64(original, "outgsk");
-				
-				xpc_object_t out = xpc_dictionary_get_value(reply, "out");
-				if(out && xpc_get_type(out)==XPC_TYPE_DICTIONARY) {
-
-					//fake WebContent Instance
-				}
-			}
-			else*/ if(subsystem==3 && routine==829) {
-				int error = xpc_dictionary_get_int64(reply, "error");
-				if(error == 0) {
-					const char* name = xpc_dictionary_get_string(reply, "name");
-					const char* bundle_identifier = xpc_dictionary_get_string(reply, "bundle_identifier");
-
-					const char* bundle = bundle_identifier ? bundle_identifier : name;
-
-					if(bundle) {
-						char client_identifier[255]={0};
-						proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
-						if(!string_has_prefix(bundle, client_identifier) && !string_has_prefix(bundle, "com.apple."))
-						{
-							JBLogDebug("hide coalition (%s) (%s) from blacklisted process(%d) %s", name, bundle_identifier, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
-					
-							xpc_dictionary_set_value(reply, "cid", NULL);
-							xpc_dictionary_set_value(reply, "name", NULL);
-							xpc_dictionary_set_value(reply, "bundle_identifier", NULL);
-							xpc_dictionary_set_value(reply, "resource-usage-blob", NULL);
-
-							xpc_dictionary_set_int64(reply, "error", 3);
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return orig_xpc_pipe_routine_reply(reply);
-}
+extern xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
+extern xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original);
+extern int (*orig_xpc_pipe_routine_reply)(xpc_object_t reply);
+extern int new_xpc_pipe_routine_reply(xpc_object_t reply);
 
 void roothide_launchd_preinit()
 {
@@ -184,12 +144,13 @@ void roothide_launchd_postinit(bool firstLoad)
 		void* __sysctlbyname_orig = NULL;
 		MSHookFunction(&__sysctl, (void *) __sysctl_hook, &__sysctl_orig);
 		MSHookFunction(&__sysctlbyname, (void *) __sysctlbyname_hook, &__sysctlbyname_orig);
+		MSHookFunction(&bind, (void*)new_bind, &orig_bind); //fix network issues on iOS16+
 	}
 #ifdef __arm64e__
 	else 
 	{
 		// iOS15 arm64e only
-		MSHookFunction(sysctlbyname, (void *)sysctlbyname_hook, (void **)&sysctlbyname_orig);
+		// MSHookFunction(sysctlbyname, (void *)sysctlbyname_hook, (void **)&sysctlbyname_orig);
 	}
 #endif
 
@@ -201,6 +162,8 @@ void roothide_launchd_postinit(bool firstLoad)
 			return;
 		}
 	}
+
+	loadAppStoredIdentifiers();
 
 	MSHookFunction(&xpc_dictionary_create_reply, (void*)new_xpc_dictionary_create_reply, &orig_xpc_dictionary_create_reply);
 	MSHookFunction(&xpc_pipe_routine_reply, (void*)new_xpc_pipe_routine_reply, &orig_xpc_pipe_routine_reply);
@@ -375,7 +338,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 
 		JBLogDebug("blacklisted app %s", path);
 
-		if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (strstr(path, "/PlugIns/") || strstr(path, ".appex/"))) {
+		if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (strstr(path, "/PlugIns/") || strstr(path, "/Extensions/") || strstr(path, ".appex/"))) {
 			JBLogDebug("prevent blacklisted app's extension from running: ", path);
 			ret = EPERM;
 		}

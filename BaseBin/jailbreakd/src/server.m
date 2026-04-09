@@ -48,7 +48,11 @@ void jailbreakd_received_message(mach_port_t port)
 					pid_t ppid = proc_get_ppid(pid);
 					JBLogDebug("spinlock fix: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
 					if(ppid == clientPid) {
-						if(proc_fix_spinlock(pid) == 0) {
+						if(ppid==1 && resume==false) {
+							//`frida -f` sucks with proc_fix_spinlock on ios15
+							result = proc_patch_csflags(pid);
+						}
+						else if(proc_fix_spinlock(pid) == 0) {
 							if(resume) kill(pid, SIGCONT);
 						} else {
 							JBLogError("spinlock fix failed: %d", pid);
@@ -69,7 +73,11 @@ void jailbreakd_received_message(mach_port_t port)
 					pid_t ppid = proc_get_ppid(pid);
 					JBLogDebug("spawn patch: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
 					if(ppid == clientPid) {
-						if(roothide_patch_proc(pid) == 0) {
+						if(ppid==1 && resume==false) {
+							//`frida -f` sucks with proc_patch_dyld on ios15
+							result = proc_patch_csflags(pid);
+						}
+						else if(roothide_patch_proc(pid) == 0) {
 							if(resume) kill(pid, SIGCONT);
 						} else {
 							JBLogError("spawn patch failed: %d", pid);
@@ -117,15 +125,22 @@ void jailbreakd_received_message(mach_port_t port)
 
 				case JBD_MSG_EXEC_TRACE_CANCEL: {
 					int64_t result = -1;
+					uint64_t detached = xpc_dictionary_get_uint64(message, "detached");
 					const char* execfile = xpc_dictionary_get_string(message, "execfile");
 					JBLogDebug("exec trace cancel: %d %s", clientPid, execfile);
-					result = execTraceCancel(clientPid);
+					result = execTraceCancel(clientPid, detached);
 					xpc_dictionary_set_int64(reply, "result", result);
 					break;
 				}
 
 				case JBD_MSG_SYSTEMWIDE_LOG: {
 #ifdef ENABLE_LOGS
+					static char logFilePath[PATH_MAX] = {0};
+					static dispatch_once_t onceToken;
+					dispatch_once(&onceToken, ^{
+						JBLogGetLogFilePath("systemwide", NULL, logFilePath);
+					});
+
 					const char* progname = NULL;
 					const char* procpath = proc_get_path(clientPid,NULL);
 					if(procpath) {
@@ -134,7 +149,7 @@ void jailbreakd_received_message(mach_port_t port)
 					}
 					uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
 					const char* log = xpc_dictionary_get_string(message, "log");
-					JBLogFunction(JBLogGetLogFilePath("systemwide", NULL, NULL), clientPid, tid, progname ? progname : "(null)", "%s", log);
+					JBLogFunction(logFilePath, clientPid, tid, progname ? progname : "(null)", "%s", log);
 					xpc_dictionary_set_int64(reply, "result", 0);
 #else
 					abort();

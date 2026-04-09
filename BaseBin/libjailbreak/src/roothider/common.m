@@ -10,6 +10,7 @@
 #include <xpc/xpc.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
+#include <mach-o/dyld.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
 
@@ -60,7 +61,7 @@ pid_t proc_get_ppid(pid_t pid)
 }
 
 // #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
-char* proc_get_path(pid_t pid, char* buffer[PATH_MAX])
+char* proc_get_path(pid_t pid, char buffer[PATH_MAX])
 {
     static char __thread threadbuffer[PATH_MAX];
     if(!buffer) buffer = threadbuffer;
@@ -106,12 +107,14 @@ char* proc_get_identifier(pid_t pid, char buffer[255])
         return NULL;
     }
     
-    char* csbuffer = malloc(header.length);
+    uint32_t bufferLen = ntohl(header.length);
+
+    char* csbuffer = malloc(bufferLen);
     if (!csbuffer) {
         return NULL;
     }
     
-    result = csops(pid, CS_OPS_IDENTITY, csbuffer, header.length);
+    result = csops(pid, CS_OPS_IDENTITY, csbuffer, bufferLen);
     if (result == 0) {
         char* identity = csbuffer + sizeof(struct csheader);
         strlcpy(buffer, identity, 255);
@@ -179,9 +182,18 @@ bool process_force_dyld_patch(const char* path, const char** argv)
         if(string_has_suffix(path, "/System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.xpc/com.apple.WebKit.WebContent")) {
             return true;
         }
-        else if(strcmp(path, "/usr/libexec/xpcproxy")==0) {
-            if (argv && argv[0] && argv[1] && string_has_prefix(argv[1], "com.apple.WebKit.WebContent")) {
-                return true;
+        else if(string_has_suffix(path, "/System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.CaptivePortal.xpc/com.apple.WebKit.WebContent.CaptivePortal")) {
+            return true;
+        }
+        else if(strcmp(path, "/usr/libexec/xpcproxy")==0)
+        {
+            if (argv && argv[0] && argv[1]) {
+                if(string_has_prefix(argv[1], "com.apple.WebKit.WebContent")) {
+                    return true;
+                }
+                else if(string_has_prefix(argv[1], "com.apple.WebKit.WebContent.CaptivePortal")) {
+                    return true;
+                }
             }
         }
     }
@@ -209,7 +221,7 @@ int roothide_config_set_spinlock_fix(bool enabled)
         NSDictionary* attr = @{NSFilePosixPermissions:@(0755), NSFileOwnerAccountID:@(501), NSFileGroupOwnerAccountID:@(501)};
         if(![NSFileManager.defaultManager createDirectoryAtPath:roothideDir withIntermediateDirectories:YES attributes:attr error:nil])
         {
-            JBLogError("Failed to create directory: %@", roothideDir);
+            JBLogError("Failed to create directory: %s", roothideDir.fileSystemRepresentation);
             return -1;
         }
     }
@@ -219,7 +231,7 @@ int roothide_config_set_spinlock_fix(bool enabled)
     if(!defaults) defaults = [[NSMutableDictionary alloc] init];
     [defaults setValue:@(enabled) forKey:@"spinlockFixApplied"];
     if(![defaults writeToFile:configFilePath atomically:YES]) {
-        JBLogError("Failed to write config file: %@", configFilePath);
+        JBLogError("Failed to write config file: %s", configFilePath.fileSystemRepresentation);
         return -1;
     }
     return 0;
@@ -580,46 +592,67 @@ int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
 
 kern_return_t bootstrap_look_up(mach_port_t port, const char *service, mach_port_t *server_port);
 
-bool otherJailbreakActived()
+bool otherJailbreakActived(bool postexploit)
 {
-    if(jbclient_roothide_jailbroken())
+    if(!postexploit)
     {
-        return false;
+        // // may be palehide
+        // uint32_t csflags = 0;
+        // csops(getpid(), CS_OPS_STATUS, &csflags, sizeof(csflags));
+        // if((csflags & CS_PLATFORM_BINARY) != 0) {
+        //     if(!builtint_palehide_test()) {
+        //         return true; // rootless dopamine 2.x
+        //     }
+        // }
     }
 
-    // // may be palehide
-    // uint32_t csFlags = 0;
-    // csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
-    // if(csFlags & CS_PLATFORM_BINARY)
-    // {
-    //     if(!builtint_palehide_test()) {
-    //         return true;
-    //     }
-    // }
+    if(!jbclient_roothide_jailbroken())
+    {
+        // it works even rootless dopamine 2.x is hidden
+        const char* rootpath = jbclient_get_jbroot();
+        if(rootpath && strlen(rootpath) > 0) {
+            return true; // rootless dopamine 2.x
+        }
+    }
 
+    struct statfs fs = {0};
+    int sfsret = statfs("/usr/lib", &fs);
+    // not work when rootless dopamine 2.x is hidden
+    if (sfsret==0 && strcmp(fs.f_mntonname, "/usr/lib")==0) {
+        return true; // rootless dopamine
+    }
+
+    if(access("/dev/md0", F_OK)==0) {
+        return true; // rootless palera1n
+    }
+
+    if(access("/dev/rmd0", F_OK)==0) {
+        return true; // rootless palera1n
+    }
+
+    // not work in sandbox
+    char pathbuf[PATH_MAX] = {0};
+    int ret = proc_pidpath(1, pathbuf, sizeof(pathbuf));
+    if(ret > 0) {
+        if(strcmp(pathbuf, "/sbin/launchd") != 0) {
+            return true; // roothide Bootstrap or NathanLR
+        }
+    } else {
+        JBLogError("proc_pidpath failed for pid 1: %d", ret);
+        assert(!postexploit);
+        // return true;
+    }
+
+    // not work in sandbox
     mach_port_t port = MACH_PORT_NULL;
     kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.opa334.jailbreakd", &port);
     if(kr == KERN_SUCCESS) {
         return true; // roothide dopamine 1.x
     }
 
-    const char* rootpath = jbclient_get_jbroot();
-    if(rootpath && strlen(rootpath) > 0) {
-        return true;
-    }
-
-    if(access("/dev/md0", F_OK)==0) {
-        return true;
-    }
-
-    if(access("/dev/rmd0", F_OK)==0) {
-        return true;
-    }
-
-    struct statfs fs;
-    int sfsret = statfs("/usr/lib", &fs);
-    if (sfsret == 0) {
-        if(strcmp(fs.f_mntonname, "/usr/lib")==0) {
+    // detect roothide dopamine 1.x in sandbox
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if(strncmp(_dyld_get_image_name(i), "/usr/lib/systemhook-", sizeof("/usr/lib/systemhook-")-1) == 0) {
             return true;
         }
     }
@@ -753,123 +786,194 @@ int ensure_dyld_trustcache(const char* path)
     return 0;
 }
 
-#define RB2_USERREBOOT (0x2000000000000000llu)
-void check_usreboot_msg(xpc_object_t xmsg)
+NSMutableArray<NSString*>* StoredAppIdentifiers = nil;
+
+void loadAppStoredIdentifiers()
 {
-	if(xpc_dictionary_get_uint64(xmsg, "flags") != RB2_USERREBOOT) {
-		return;
-	}
-	if(xpc_dictionary_get_uint64(xmsg, "type") != 1) {
-		return;
-	}
-	if(!xpc_dictionary_get_value(xmsg, "handle")
-     || xpc_dictionary_get_uint64(xmsg, "handle") != 0) {
-		return;
-	}
-	
-	if(getpid() != 1) {
-		JBLogError("usereboot message not from launchd?");
-		return;
-	}
+    StoredAppIdentifiers = [[NSMutableArray alloc] init];
 
-	audit_token_t clientToken = {0};
-	xpc_dictionary_get_audit_token(xmsg, &clientToken);
-
-	uint32_t csflags = 0;
-	csops(audit_token_to_pid(clientToken), CS_OPS_STATUS, &csflags, sizeof(csflags));
-
-	if((csflags & CS_PLATFORM_BINARY) == 0) {
-		JBLogError("usereboot message not from platform process?");
-		return;
-	}
-
-	struct statfs fsb={0};
-	if (statfs("/Developer", &fsb) != 0) {
-		JBLogError("unable to statfs /Developer, already broken?");
-		return;
-	}
-
-	if(strcmp(fsb.f_mntonname, "/Developer") != 0) {
-		JBLogDebug("/Developer not mounted. skip");
-		return;
-	}
-
-	// fix Xcode debugging being broken after the userspace reboot
-	// for iOS15 it is too late by the time launchd re-execs itself
-
-	int retval = unmount("/Developer", MNT_FORCE);
-
-	if(retval != 0) {
-		JBLogError("unmount /Developer : %d %d,%s", retval, errno, strerror(errno));
-	}
-}
-
-void roothide_handler_jbserver_msg(xpc_object_t xmsg)
-{
-    check_usreboot_msg(xmsg);
-
-    audit_token_t clientToken = { 0 };
-    xpc_dictionary_get_audit_token(xmsg, &clientToken);
-
-#ifdef ENABLE_LOGS
-	if(xpc_dictionary_get_value(xmsg, "jb-domain") && xpc_dictionary_get_value(xmsg, "action")) {
-		const char* desc = NULL;
-		JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
-			audit_token_to_pid(clientToken), 
-			proc_get_path(audit_token_to_pid(clientToken),NULL), 
-			(desc=xpc_copy_description(xmsg)));
-		if(desc) free((void*)desc);
-	}
-#endif
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *applicationsPath = @"/private/var/containers/Bundle/Application/";
     
-    if(isBlacklistedToken(&clientToken))
+    NSError *error = nil;
+    NSArray *appContainers = [fileManager contentsOfDirectoryAtPath:applicationsPath error:&error];
+    if (error) {
+        JBLogError("Error reading Application directory: %s", error.description.UTF8String);
+        abort();
+    }
+    
+    for (NSString *containerUUID in appContainers) 
     {
-        const char* desc = NULL;
-        JBLogDebug("launchd xpc message from blacklisted process(%d) %s :\n%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL), (desc=xpc_copy_description(xmsg)));
-        if(desc) free((void*)desc);
+        NSString *containerPath = [applicationsPath stringByAppendingPathComponent:containerUUID];
 
-        uint64_t routine = xpc_dictionary_get_uint64(xmsg, "routine");
-        uint64_t subsystem = xpc_dictionary_get_uint64(xmsg, "subsystem");
-        if(subsystem==2 && routine==708) {
-            const char* name = xpc_dictionary_get_string(xmsg, "name");
-            if(name) {
-                char* bundle = NULL;
-                if(string_has_prefix(name, "UIKitApplication:")) {
-                    bundle = name+sizeof("UIKitApplication:")-1;
-                    char* end = strchr(bundle, '[');
-                    if(end) {
-                        asprintf(&bundle, "%.*s", (int)(end - bundle), bundle);
-                    } else {
-                        bundle = strdup(bundle);
-                    }
-                } else {
-                    bundle = strdup(name);
-                }
-
-                char client_identifier[255]={0};
-                proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
-
-                if(!string_has_prefix(bundle, client_identifier) && !string_has_prefix(bundle, "com.apple."))
-                {
-                    JBLogDebug("hide job (%s) (%s) from blacklisted process(%d) %s", name, bundle, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
-                    xpc_dictionary_set_string(xmsg, "name", "");
-                }
-
-                free((void*)bundle);
-            }
+        NSString *metadataPlistPath = [containerPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *metadataPlist = [NSDictionary dictionaryWithContentsOfFile:metadataPlistPath];
+        NSString *MCMMetadataIdentifier = metadataPlist[@"MCMMetadataIdentifier"];
+        if(!MCMMetadataIdentifier) {
+            JBLogDebug("Skipping container with no MCMMetadataIdentifier: %s", containerPath.UTF8String);
+            continue;
         }
-        else if(subsystem==6 && routine==301) {
 
-            int pid = xpc_dictionary_get_int64(xmsg, "pid");
+        if([fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"_TrollStore"]]
+            || [fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"_TrollStoreLite"]])
+        {
+            JBLogDebug("Skipping trollstored app container: %s : %s", MCMMetadataIdentifier.UTF8String, containerPath.UTF8String);
+            continue;
+        }
 
-            char path[PATH_MAX]={0};
-            if(pid>0 && pid!=audit_token_to_pid(clientToken) && proc_get_path(pid, path)) 
+        if(![fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"]])
+        {
+            JBLogDebug("Skipping non-stored app container: %s : %s", MCMMetadataIdentifier.UTF8String, containerPath.UTF8String);
+            continue;
+        }
+
+        NSArray *containerContents = [fileManager contentsOfDirectoryAtPath:containerPath error:nil];
+        for (NSString *item in containerContents)
+        {
+            if ([item hasSuffix:@".app"]) 
             {
-                if(hasTrollstoreMarker(path) || isSubPathOf(path, JBROOT_PATH("/"))) {
-                    JBLogDebug("hide pid %d (%s) from blacklisted process(%d) %s", pid, path, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
-                    xpc_dictionary_set_int64(xmsg, "pid", INT_MAX);
+                NSString *appPath = [containerPath stringByAppendingPathComponent:item];
+                NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                NSString *appBundleID = infoPlist[@"CFBundleIdentifier"];
+
+                if([appBundleID isEqualToString:MCMMetadataIdentifier]==NO) {
+                    JBLogDebug("*** Mismatched Bundle ID and MCMMetadataIdentifier: %s != %s : %s", appBundleID.UTF8String, MCMMetadataIdentifier.UTF8String, appPath.UTF8String);
+                }
+                
+                if(![fileManager fileExistsAtPath:[appPath stringByAppendingPathComponent:@"SC_Info"]])
+                {
+                    JBLogDebug("Skipping non-encrypted app: %s", appPath.UTF8String);
+                    continue;
+                }
+
+                if (appBundleID) {
+                    JBLogDebug("App: %s -> %s", item.UTF8String, appBundleID.UTF8String);
+                    [StoredAppIdentifiers addObject:appBundleID];
+                } else {
+                    JBLogDebug("*** No Bundle ID found: %s", appPath.UTF8String);
+                    continue;
+                }
+                
+                NSString *plugInsPath = [appPath stringByAppendingPathComponent:@"PlugIns"];
+                if ([fileManager fileExistsAtPath:plugInsPath]) 
+                {
+                    NSArray *plugIns = [fileManager contentsOfDirectoryAtPath:plugInsPath error:nil];
+                    for (NSString *plugIn in plugIns) 
+                    {
+                        NSString *plugInPath = [plugInsPath stringByAppendingPathComponent:plugIn];
+                        NSString *plugInInfoPath = [plugInPath stringByAppendingPathComponent:@"Info.plist"];
+                        NSDictionary *plugInInfo = [NSDictionary dictionaryWithContentsOfFile:plugInInfoPath];
+                        NSString *plugInBundleID = plugInInfo[@"CFBundleIdentifier"];
+                        
+                        if (plugInBundleID) {
+                            JBLogDebug("  PlugIn: %s -> %s", plugIn.UTF8String, plugInBundleID.UTF8String);
+                            [StoredAppIdentifiers addObject:plugInBundleID];
+                        } else {
+                            JBLogDebug("  *** No Bundle ID found: %s", plugInPath.UTF8String);
+                        }
+                    }
+                }
+
+                NSString *extensionsPath = [appPath stringByAppendingPathComponent:@"Extensions"];
+                if ([fileManager fileExistsAtPath:extensionsPath]) 
+                {
+                    NSArray *extensions = [fileManager contentsOfDirectoryAtPath:extensionsPath error:nil];
+                    for (NSString *extension in extensions) 
+                    {
+                        NSString *extensionPath = [extensionsPath stringByAppendingPathComponent:extension];
+                        NSString *extensionInfoPath = [extensionPath stringByAppendingPathComponent:@"Info.plist"];
+                        NSDictionary *extensionInfo = [NSDictionary dictionaryWithContentsOfFile:extensionInfoPath];
+                        NSString *extensionBundleID = extensionInfo[@"CFBundleIdentifier"];
+                        
+                        if (extensionBundleID) {
+                            JBLogDebug("  Extensions: %s -> %s", extension.UTF8String, extensionBundleID.UTF8String);
+                            [StoredAppIdentifiers addObject:extensionBundleID];
+                        } else {
+                            JBLogDebug("  *** No Bundle ID found: %s", extensionPath.UTF8String);
+                        }
+                    }
                 }
             }
         }
     }
 }
+
+bool is_apple_internal_identifier(const char* identifier)
+{
+    if(!identifier || !*identifier) return false;
+    
+    for(NSString* item in APPLE_INTERNAL_IDENTIFIERS) {
+        if([@(identifier) hasPrefix:item]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_sensitive_app_identifier(const char* identifier)
+{
+    if(!identifier || !*identifier) return false;
+
+    for(NSString* item in SENSITIVE_APP_IDENTIFIERS) {
+        if([@(identifier) hasPrefix:item]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_safe_bundle_identifier(const char* identifier)
+{
+    if(!identifier || !*identifier) return false;
+
+    /* ios15 /System/Library/LaunchDaemons/com.apple.tvremoted.plist */
+    if(strcmp(identifier, "$(PRODUCT_BUNDLE_IDENTIFIER)")==0) {
+        return true;
+    }
+
+    if(string_has_prefix(identifier, "lockdown.") && strstr(identifier, ".com.apple.")) {
+        return true;
+    }
+
+    if(string_has_prefix(identifier, "com.apple."))
+    {
+        if(is_apple_internal_identifier(identifier)) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    if(is_sensitive_app_identifier(identifier)) {
+        return false;
+    }
+
+    assert(StoredAppIdentifiers != nil);
+    if([StoredAppIdentifiers containsObject:@(identifier)]) {
+        return true;
+    }
+
+    return false;
+}
+
+int wait_for_exit(pid_t pid)
+{
+    while (1)  
+    {
+		int status=0;
+        if (waitpid(pid, &status, 0) == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("waitpid");
+            return -1;
+        }
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            return 128 + WTERMSIG(status);
+        }
+    }
+}
+
